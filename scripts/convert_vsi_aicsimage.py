@@ -20,60 +20,18 @@ from datetime import datetime
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
+from joblib import Parallel, delayed
 
 # Suppress SLF4J warnings from Java-based image readers (bioformats)
 os.environ["JAVA_TOOL_OPTIONS"] = "-Dorg.slf4j.simpleLogger.defaultLogLevel=off"
 
-# Import AICSImage for VSI reading
-try:
-    from aicsimageio import AICSImage
-
-    AICSIMAGE_AVAILABLE = True
-except ImportError:
-    AICSIMAGE_AVAILABLE = False
-    print("ERROR: aicsimageio not available. Please install it.")
-    sys.exit(1)
-
-# Try to import tifffile for TIFF writing
-try:
-    import tifffile
-
-    TIFFFILE_AVAILABLE = True
-except ImportError:
-    TIFFFILE_AVAILABLE = False
-
-# Try pyvips as alternative for TIFF writing
-try:
-    import pyvips
-
-    PYVIPS_AVAILABLE = True
-except ImportError:
-    PYVIPS_AVAILABLE = False
-
-# Try bfio for robust tile-based reading (fallback for large images)
-try:
-    from bfio import BioReader
-
-    BFIO_AVAILABLE = True
-except ImportError:
-    BFIO_AVAILABLE = False
-
-# Try OpenSlide for whole slide image reading (another fallback)
-try:
-    import openslide
-
-    OPENSLIDE_AVAILABLE = True
-except ImportError:
-    OPENSLIDE_AVAILABLE = False
-
-# Try jpype for direct Bio-Formats tile reading
-try:
-    import jpype
-    import jpype.imports
-
-    JPYPE_AVAILABLE = True
-except ImportError:
-    JPYPE_AVAILABLE = False
+from aicsimageio import AICSImage
+import tifffile
+import pyvips
+from bfio import BioReader
+import openslide
+import jpype
+import jpype.imports
 
 # Configure logging
 logging.basicConfig(
@@ -87,6 +45,11 @@ DEFAULT_IMAGE_DIR = "/mnt/histopathology/E0141/P01"
 DEFAULT_OUTPUT_DIR = (
     "/home/scai/scratch/E0141_CUP/data/trident_processing/converted_wsis"
 )
+
+# ============ Performance Configuration ============
+# Toggle multiprocessing
+ENABLE_MULTIPROCESSING = True  # Parallel file conversion with joblib
+NUM_WORKERS = 16  # Number of parallel workers (adjust based on available memory)
 
 
 def load_vsi_with_bfio(input_path, tile_size=2048):
@@ -725,6 +688,31 @@ def convert_single_vsi(input_path, output_path, force=False):
         }
 
 
+def process_single_vsi_record(record, force):
+    """
+    Process a single VSI record for parallel execution.
+
+    Args:
+        record: Dictionary containing VSI record information
+        force: Force overwrite flag
+
+    Returns:
+        dict: Processing result with metadata
+    """
+    result = convert_single_vsi(
+        record["input_path"],
+        record["output_path"],
+        force=force,
+    )
+    result.update(
+        {
+            "image_label": record["image_label"],
+            "prep_lims_id": record["prep_lims_id"],
+        }
+    )
+    return result
+
+
 def load_metadata(metadata_path):
     """
     Load metadata from Excel file.
@@ -804,6 +792,9 @@ def main():
     logger.info(f"Output directory: {args.output_dir}")
     logger.info(f"Force overwrite: {args.force}")
     logger.info(f"Test mode: {args.test}")
+    logger.info(
+        f"Multiprocessing: {ENABLE_MULTIPROCESSING} (workers={NUM_WORKERS if ENABLE_MULTIPROCESSING else 1})"
+    )
     logger.info(f"AICSImage available: {AICSIMAGE_AVAILABLE}")
     logger.info(f"jpype available: {JPYPE_AVAILABLE}")
     logger.info(f"bfio available: {BFIO_AVAILABLE}")
@@ -851,28 +842,28 @@ def main():
         logger.info("TEST MODE: Converting only the first file")
         vsi_records = vsi_records[:1]
 
-    # Convert files
-    logger.info(f"\nConverting {len(vsi_records)} VSI files...")
-    results = []
-
-    for record in tqdm(vsi_records, desc="Converting VSI files"):
+    # Convert files with parallel or sequential processing
+    if ENABLE_MULTIPROCESSING and len(vsi_records) > 1:
         logger.info(
-            f"\nProcessing: {record['image_label']} -> {record['prep_lims_id']}"
+            f"\nConverting {len(vsi_records)} VSI files in parallel with {NUM_WORKERS} workers..."
         )
-
-        result = convert_single_vsi(
-            record["input_path"], record["output_path"], force=args.force
+        results = Parallel(n_jobs=NUM_WORKERS, backend="loky")(
+            delayed(process_single_vsi_record)(record, args.force)
+            for record in tqdm(vsi_records, desc="Converting VSI files")
         )
+    else:
+        logger.info(f"\nConverting {len(vsi_records)} VSI files sequentially...")
+        results = []
 
-        result.update(
-            {
-                "image_label": record["image_label"],
-                "prep_lims_id": record["prep_lims_id"],
-            }
-        )
-        results.append(result)
+        for record in tqdm(vsi_records, desc="Converting VSI files"):
+            logger.info(
+                f"\nProcessing: {record['image_label']} -> {record['prep_lims_id']}"
+            )
 
-        logger.info(f"  Status: {result['status']} - {result['message']}")
+            result = process_single_vsi_record(record, args.force)
+            results.append(result)
+
+            logger.info(f"  Status: {result['status']} - {result['message']}")
 
     # Summary statistics
     logger.info("\n" + "=" * 70)
